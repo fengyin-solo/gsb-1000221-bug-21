@@ -19,9 +19,16 @@
     </div>
 
     <form class="filter-bar" @submit.prevent="reload">
-      <label v-for="field in filterFields" :key="field" class="filter-item">
-        <span>{{ field }}</span>
-        <input v-model="filters[field]" :placeholder="`按${field}检索`" />
+      <label class="filter-item">
+        <span>清洗编号</span>
+        <input v-model="keyword" placeholder="按清洗编号检索" />
+      </label>
+      <label class="filter-item">
+        <span>清洗状态</span>
+        <select v-model="statusFilter">
+          <option value="">全部状态</option>
+          <option v-for="status in statuses" :key="status" :value="status">{{ status }}</option>
+        </select>
       </label>
       <button class="btn" type="submit">查询</button>
       <button class="btn ghost" type="button" @click="resetFilters">重置条件</button>
@@ -38,15 +45,18 @@
         <tr v-for="row in rows" :key="String(row.id)">
           <td v-for="column in columns" :key="column">{{ row[column] ?? '—' }}</td>
           <td class="row-actions">
-            <button
-              v-for="action in actions"
-              :key="action"
-              class="link"
-              type="button"
-              @click="runAction(action, row)"
-            >
-              {{ action }}
-            </button>
+            <button class="link" type="button" @click="openDetail(row)">详情</button>
+            <template v-if="!isTerminal(row)">
+              <button
+                v-for="action in actions"
+                :key="action"
+                class="link"
+                type="button"
+                @click="runAction(action, row)"
+              >
+                {{ action }}
+              </button>
+            </template>
           </td>
         </tr>
         <tr v-if="!rows.length">
@@ -59,6 +69,41 @@
       <span>共 {{ total }} 条组件清洗记录</span>
       <span v-if="errorMessage" class="error-text">{{ errorMessage }}</span>
     </footer>
+
+    <div v-if="detailVisible" class="dialog-mask" @click.self="closeDetail">
+      <div class="dialog-panel">
+        <header class="dialog-head">
+          <h3>{{ detailMode === 'create' ? '登记清洗任务' : `清洗任务详情 #${detailId}` }}</h3>
+          <span v-if="detailMode === 'edit'" class="dialog-version">
+            版本 {{ detailVersion }} · {{ detailStatus }}<template v-if="detailLocked">（已锁定）</template>
+          </span>
+        </header>
+        <div class="dialog-body">
+          <label v-for="field in editableFields" :key="field" class="dialog-field">
+            <span>{{ field }}</span>
+            <input v-model="detailForm[field]" :disabled="detailLocked" />
+          </label>
+          <label class="dialog-field">
+            <span>清洗状态</span>
+            <input :value="detailMode === 'create' ? '待清洗（登记后默认）' : detailStatus" disabled />
+          </label>
+        </div>
+        <p v-if="detailMessage" class="error-text dialog-message">{{ detailMessage }}</p>
+        <footer class="dialog-foot">
+          <button v-if="detailMode === 'edit'" class="btn" type="button" @click="refreshDetail">载入最新数据</button>
+          <button
+            v-if="detailMode === 'edit' && !detailLocked"
+            class="btn primary"
+            type="button"
+            @click="confirmDetail"
+          >
+            确认完成
+          </button>
+          <button v-if="!detailLocked" class="btn primary" type="button" @click="saveDetail">保存</button>
+          <button class="btn ghost" type="button" @click="closeDetail">关闭</button>
+        </footer>
+      </div>
+    </div>
   </section>
 </template>
 
@@ -71,18 +116,34 @@ type Row = Record<string, string | number | null>
 
 const ENDPOINT = '/api/panel_clean'
 const columns = ["清洗编号", "清洗区域", "组件数量", "清洗方式", "清洗日期", "清洗班组", "清洗效果", "清洗状态"]
+const editableFields = columns.slice(0, 7)
 const actions = ["安排清洗", "开始清洗", "确认完成"]
 const statuses = ["待清洗", "清洗中", "已完成", "已取消"]
+const terminalStatuses = ["已完成", "已取消"]
 const stats = [{"label": "待清洗区域", "value": 0}, {"label": "清洗中区域", "value": 0}, {"label": "本月清洗量", "value": 0}]
 
 const rows = ref<Row[]>([])
 const total = ref(0)
 const errorMessage = ref('')
-const filters = ref<Record<string, string>>({})
-const filterFields = columns.slice(0, 3)
+const keyword = ref('')
+const statusFilter = ref('')
+
+const detailVisible = ref(false)
+const detailMode = ref<'create' | 'edit'>('edit')
+const detailId = ref<number | null>(null)
+const detailVersion = ref(1)
+const detailStatus = ref('')
+const detailLocked = ref(false)
+const detailForm = ref<Record<string, string | number>>({})
+const detailMessage = ref('')
+
+function isTerminal(row: Row) {
+  return terminalStatuses.includes(String(row['清洗状态'] ?? ''))
+}
 
 function resetFilters() {
-  filters.value = {}
+  keyword.value = ''
+  statusFilter.value = ''
   void reload()
 }
 
@@ -90,19 +151,118 @@ function exportRows() {
   window.open(`${ENDPOINT}/export`, '_blank')
 }
 
+function applyEntry(entry: Row) {
+  detailId.value = Number(entry.id)
+  detailVersion.value = Number(entry.version ?? 1)
+  detailStatus.value = String(entry['清洗状态'] ?? '')
+  detailLocked.value = terminalStatuses.includes(detailStatus.value)
+  const form: Record<string, string | number> = {}
+  for (const field of editableFields) {
+    const value = entry[field]
+    form[field] = value === null || value === undefined ? '' : value
+  }
+  detailForm.value = form
+}
+
+async function fetchDetail(id: number): Promise<Row | null> {
+  const response = await request(`${ENDPOINT}/${id}`)
+  if (!response.ok) {
+    return null
+  }
+  return (await response.json()) as Row
+}
+
+async function openDetail(row: Row) {
+  detailMessage.value = ''
+  try {
+    const entry = await fetchDetail(Number(row.id))
+    if (!entry) {
+      errorMessage.value = '清洗任务详情读取失败'
+      return
+    }
+    detailMode.value = 'edit'
+    applyEntry(entry)
+    detailVisible.value = true
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '清洗任务详情读取失败'
+  }
+}
+
 function openCreate() {
-  errorMessage.value = '清洗任务登记入口尚未接入审批流'
+  detailMode.value = 'create'
+  detailId.value = null
+  detailVersion.value = 0
+  detailStatus.value = statuses[0]
+  detailLocked.value = false
+  detailForm.value = {}
+  detailMessage.value = ''
+  detailVisible.value = true
+}
+
+function closeDetail() {
+  detailVisible.value = false
+}
+
+async function refreshDetail() {
+  if (detailId.value === null) {
+    return
+  }
+  detailMessage.value = ''
+  try {
+    const entry = await fetchDetail(detailId.value)
+    if (!entry) {
+      detailMessage.value = '最新数据读取失败，请稍后重试'
+      return
+    }
+    applyEntry(entry)
+  } catch (error) {
+    detailMessage.value = error instanceof Error ? error.message : '最新数据读取失败'
+  }
+}
+
+async function saveDetail() {
+  detailMessage.value = ''
+  const isCreate = detailMode.value === 'create'
+  const body: Record<string, unknown> = { values: detailForm.value }
+  if (!isCreate) {
+    body.version = detailVersion.value
+  }
+  try {
+    const response = await request(isCreate ? ENDPOINT : `${ENDPOINT}/${detailId.value}`, {
+      method: isCreate ? 'POST' : 'PUT',
+      body: JSON.stringify(body),
+    })
+    const payload = await response.json()
+    if (!response.ok || !payload.ok) {
+      detailMessage.value = payload?.message ?? '清洗任务保存失败，请稍后重试'
+      return
+    }
+    detailVisible.value = false
+    await reload()
+  } catch (error) {
+    detailMessage.value = error instanceof Error ? error.message : '清洗任务保存失败'
+  }
+}
+
+async function postAction(action: string, id: number): Promise<{ ok: boolean; message: string }> {
+  const response = await request(`${ENDPOINT}/${id}/actions`, {
+    method: 'POST',
+    body: JSON.stringify({ values: { action } }),
+  })
+  const payload = await response.json().catch(() => null)
+  if (!response.ok || !payload) {
+    return { ok: false, message: '组件清洗动作未生效，请稍后重试' }
+  }
+  return { ok: Boolean(payload.ok), message: String(payload.message ?? '') }
 }
 
 async function runAction(action: string, row: Row) {
   errorMessage.value = ''
   try {
-    const response = await request(`${ENDPOINT}/${row.id}/actions`, {
-      method: 'POST',
-      body: JSON.stringify({ action }),
-    })
-    if (!response.ok) {
-      throw new Error('组件清洗动作未生效，请稍后重试')
+    const result = await postAction(action, Number(row.id))
+    if (!result.ok) {
+      errorMessage.value = result.message
+      return
     }
     await reload()
   } catch (error) {
@@ -110,11 +270,35 @@ async function runAction(action: string, row: Row) {
   }
 }
 
+async function confirmDetail() {
+  if (detailId.value === null) {
+    return
+  }
+  detailMessage.value = ''
+  try {
+    const result = await postAction('确认完成', detailId.value)
+    if (!result.ok) {
+      detailMessage.value = result.message
+      return
+    }
+    detailVisible.value = false
+    await reload()
+  } catch (error) {
+    detailMessage.value = error instanceof Error ? error.message : '组件清洗操作失败'
+  }
+}
+
 async function reload() {
   errorMessage.value = ''
-  const query = new URLSearchParams(filters.value as Record<string, string>).toString()
+  const query = new URLSearchParams()
+  if (keyword.value.trim()) {
+    query.set('keyword', keyword.value.trim())
+  }
+  if (statusFilter.value) {
+    query.set('status', statusFilter.value)
+  }
   try {
-    const response = await request(`${ENDPOINT}?${query}`)
+    const response = await request(`${ENDPOINT}?${query.toString()}`)
     if (!response.ok) {
       throw new Error('清洗任务列表读取失败')
     }
@@ -128,3 +312,69 @@ async function reload() {
 
 onMounted(reload)
 </script>
+
+<style scoped>
+.dialog-mask {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 20;
+}
+.dialog-panel {
+  background: #fff;
+  border-radius: 10px;
+  padding: 16px 20px;
+  width: 560px;
+  max-width: 92vw;
+  box-shadow: 0 12px 32px rgba(15, 23, 42, 0.18);
+}
+.dialog-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 12px;
+}
+.dialog-head h3 {
+  margin: 0;
+  font-size: 15px;
+}
+.dialog-version {
+  color: var(--muted);
+  font-size: 12px;
+}
+.dialog-body {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px 14px;
+}
+.dialog-field span {
+  display: block;
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 2px;
+}
+.dialog-field input {
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-size: 13px;
+}
+.dialog-field input:disabled {
+  background: #f1f5f9;
+  color: var(--muted);
+}
+.dialog-message {
+  margin: 10px 0 0;
+  font-size: 13px;
+}
+.dialog-foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 14px;
+}
+</style>

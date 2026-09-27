@@ -1,4 +1,4 @@
-"""组件清洗接口：维护清洗任务，覆盖安排清洗、开始清洗、确认完成等动作。"""
+"""组件清洗接口：维护清洗任务，覆盖安排清洗、开始清洗、确认完成等动作与详情保存。"""
 from __future__ import annotations
 
 from typing import Any
@@ -46,6 +46,17 @@ def create_entry(payload: EntryPayload) -> ActionResult:
     if missing:
         return ActionResult(ok=False, message=f"缺少必填字段：{'、'.join(missing)}")
     return ActionResult(ok=True, message="清洗任务已登记", entry=entry)
+
+
+@router.put("/{entry_id}", response_model=ActionResult)
+def update_entry(entry_id: int, payload: EntryPayload) -> ActionResult:
+    """按 id 保存清洗任务详情；版本不符时拒绝覆盖，返回当前记录，保留最后一次有效确认。"""
+    entry, message, conflict = service.update_entry(entry_id, payload.values)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=message)
+    if conflict:
+        return ActionResult(ok=False, message=message, entry=entry)
+    return ActionResult(ok=True, message=message, entry=entry)
 
 
 @router.post("/{entry_id}/actions", response_model=ActionResult)
